@@ -1,0 +1,112 @@
+# main_etl.yaml
+# Workflow maestro que orquesta la ingesta y la transformación DWH.
+
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+        - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+        - location: "europe-west3"
+        - location2: "europe-west1"
+        - day_unix: 86400      # segundos en un día
+        - yesterday_iso: ${time.format(sys.now() - day_unix)}
+        - ingestion_date: ${text.split(yesterday_iso, "T")[0]}
+
+
+    - log_start_main:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '${"[WF-MAIN] Iniciando ETL principal para la fecha: " + ingestion_date}'
+
+    # ========================================================================
+    # PASO 1: Ejecutar el workflow de INGESTA
+    # ========================================================================
+    - try_call_ingesta:
+        try:
+          steps:
+            - log_calling_ingesta:
+                call: sys.log
+                args:
+                  severity: "INFO"
+                  json:
+                    message: '[WF-MAIN] Llamando a sub-workflow: wf-ingesta'
+            - create_ingesta_args:
+                assign:
+                  - ingesta_args:
+                      start_date: ${ingestion_date}
+                      end_date: ${ingestion_date}
+            - call_ingesta:
+                call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                args:
+                  workflow_id: "wf-ingesta"
+                  location: ${location2}
+                  argument: ${ingesta_args}
+                result: ingesta_result
+        except:
+          as: e
+          steps:
+            - log_ingesta_error:
+                call: sys.log
+                args:
+                  severity: "ERROR"
+                  json:
+                    message: '[WF-MAIN] El sub-workflow de ingesta falló.'
+                    error: ${e}
+            - raise_ingesta_error:
+                raise: ${e}
+
+    - log_ingesta_success:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '[WF-MAIN] El sub-workflow de ingesta finalizó con éxito.'
+
+    # ========================================================================
+    # PASO 2: Ejecutar el workflow de DWH
+    # ========================================================================
+    - try_call_dwh:
+        try:
+          steps:
+            - log_calling_dwh:
+                call: sys.log
+                args:
+                  severity: "INFO"
+                  json:
+                    message: '[WF-MAIN] Llamando a sub-workflow: wf-dwh'
+            - create_dwh_args:
+                assign:
+                  - dwh_args:
+                      ingestion_date: ${ingestion_date}
+            - call_dwh:
+                call: googleapis.workflowexecutions.v1.projects.locations.workflows.executions.run
+                args:
+                  workflow_id: "wf-DWH"
+                  location: ${location}
+                  argument: ${dwh_args}
+                result: dwh_result
+        except:
+          as: e
+          steps:
+            - log_dwh_error:
+                call: sys.log
+                args:
+                  severity: "ERROR"
+                  json:
+                    message: '[WF-MAIN] El sub-workflow de DWH falló.'
+                    error: ${e}
+            - raise_dwh_error:
+                raise: ${e}
+
+    - log_dwh_success:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '[WF-MAIN] El sub-workflow de DWH finalizó con éxito.'
+
+    - return_ok:
+        return: "ETL principal completado con éxito."

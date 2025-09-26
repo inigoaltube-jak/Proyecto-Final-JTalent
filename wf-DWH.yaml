@@ -1,0 +1,528 @@
+# wf-dwh.yaml
+# Orquesta el proceso de transformación ELT en BigQuery con paralelización por fases.
+
+main:
+  params: [input]
+  steps:
+    - init:
+        assign:
+          - project: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - raw_dataset: "bxpert-gcp-ialtube.raw"
+          - stg_dataset: "bxpert-gcp-ialtube.stg"
+          - dwh_dataset: "bxpert-gcp-ialtube.dwh"
+          - ingestion_date: ${input.ingestion_date}
+
+    - log_start_dwh:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '${"[WF-DWH] Iniciando proceso de transformación para la fecha: " + ingestion_date}'
+
+     # ========================================================================
+    # FASE 1: Cargar y limpiar datos desde RAW a STAGING 
+    # ========================================================================
+
+    - parallel_load_staging_part1:
+        parallel:
+          branches:
+            - stg_customers:
+                steps:
+                  - populate_stg_customers:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.customers`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.customers`
+                              (CustomerID, CustomerTypeID, AddressID, FirstName, LastName, DateOfBirth)
+                            SELECT
+                              CustomerID,
+                              CustomerTypeID,
+                              AddressID,
+                              FirstName,
+                              LastName,
+                              SAFE.PARSE_DATE('%Y-%m-%d', DateOfBirth)
+                            FROM (
+                              -- Tu lógica de de-duplicación es perfecta. La mantenemos.
+                              SELECT *,
+                                     ROW_NUMBER() OVER (
+                                       PARTITION BY CustomerID
+                                       ORDER BY ingestion_date DESC
+                                     ) AS rn
+                              FROM `bxpert-gcp-ialtube.raw.customers_ext`
+                              WHERE ingestion_date = @run_date
+                            )
+                            WHERE rn = 1;
+
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+            - stg_accounts:
+                steps:
+                  - populate_stg_accounts:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.accounts`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.accounts`
+                              (AccountID, CustomerID, AccountTypeID, AccountStatusID, Balance, OpeningDate)
+                            SELECT
+                              AccountID, CustomerID, AccountTypeID, AccountStatusID, Balance,
+                              SAFE.PARSE_DATE('%Y-%m-%d', OpeningDate)
+                            FROM `bxpert-gcp-ialtube.raw.accounts_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+            - stg_loans:
+                steps:
+                  - populate_stg_loans:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.loans`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.loans`
+                              (LoanID, AccountID, LoanStatusID, PrincipalAmount, InterestRate, StartDate, EstimatedEndDate)
+                            SELECT
+                              LoanID, AccountID, LoanStatusID, PrincipalAmount, InterestRate,
+                              SAFE.PARSE_DATE('%Y-%m-%d', StartDate),
+                              SAFE.PARSE_DATE('%Y-%m-%d', EstimatedEndDate)
+                            FROM `bxpert-gcp-ialtube.raw.loans_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+
+            - stg_addresses:
+                steps:
+                  - populate_stg_addresses:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.addresses`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.addresses`
+                              (AddressID, Country, City, Street)
+                            SELECT AddressID, Country, City, Street
+                            FROM `bxpert-gcp-ialtube.raw.addresses_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+            - stg_branches:
+                steps:
+                  - populate_stg_branches:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.branches`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.branches`
+                              (BranchID, BranchName, AddressID)
+                            SELECT BranchID, BranchName, AddressID
+                            FROM `bxpert-gcp-ialtube.raw.branches_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+            
+
+    - parallel_load_staging_part2:
+        parallel:
+          branches:
+            - stg_customer_types:
+                steps:
+                  - populate_stg_customer_types:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.customer_types`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.customer_types`
+                              (CustomerTypeID, TypeName)
+                            SELECT CustomerTypeID, TypeName
+                            FROM `bxpert-gcp-ialtube.raw.customer_types_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+            - stg_account_types:
+                steps:
+                  - populate_stg_account_types:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.account_types`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.account_types`
+                              (AccountTypeID, TypeName)
+                            SELECT AccountTypeID, TypeName
+                            FROM `bxpert-gcp-ialtube.raw.account_types_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+            - stg_account_statuses:
+                steps:
+                  - populate_stg_account_statuses:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.account_statuses`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.account_statuses`
+                              (AccountStatusID, StatusName)
+                            SELECT AccountStatusID, StatusName
+                            FROM `bxpert-gcp-ialtube.raw.account_statuses_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+            - stg_loan_statuses:
+                steps:
+                  - populate_stg_loan_statuses:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.loan_statuses`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.loan_statuses`
+                              (LoanStatusID, StatusName)
+                            SELECT LoanStatusID, StatusName
+                            FROM `bxpert-gcp-ialtube.raw.loan_statuses_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+            
+            - stg_transactions:
+                steps:
+                  - populate_stg_transactions:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.transactions`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.transactions`
+                              (TransactionID, AccountOriginID, AccountDestinationID, TransactionTypeID, BranchID, Amount, Description, TransactionDate)
+                            SELECT
+                              TransactionID,
+                              AccountOriginID,
+                              AccountDestinationID,
+                              TransactionTypeID,
+                              BranchID,
+                              Amount,
+                              Description,
+                              -- El formato del JSON es 'YYYY-MM-DD HH:MM:SS'
+                              SAFE.PARSE_TIMESTAMP('%Y-%m-%d %H:%M:%S', TransactionDate)
+                            FROM `bxpert-gcp-ialtube.raw.transactions_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+            - stg_transaction_types:
+                steps:
+                  - populate_stg_transaction_types:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            TRUNCATE TABLE `bxpert-gcp-ialtube.stg.transaction_types`;
+                            INSERT INTO `bxpert-gcp-ialtube.stg.transaction_types`
+                              (TransactionTypeID, TypeName)
+                            SELECT TransactionTypeID, TypeName
+                            FROM `bxpert-gcp-ialtube.raw.transaction_types_ext`
+                            WHERE ingestion_date = @run_date;
+                          queryParameters:
+                            - name: "run_date"
+                              parameterType:
+                                type: "DATE"
+                              parameterValue:
+                                value: ${ingestion_date}
+                          useLegacySql: false
+
+
+    - log_staging_done:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '[WF-DWH] FASE 1 completada: Capa de Staging poblada.'
+
+
+    # ========================================================================
+    # FASE 2: Cargar y Sincronizar Dimensiones (parcial paralelo + secuencial)
+    # ========================================================================
+    - parallel_load_dimensions:
+        parallel:
+          branches:
+            - dim_catalogs_and_geo:
+                steps:
+                  - sync_dim_customer_type:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.dim_customer_type` T USING (SELECT DISTINCT CustomerTypeID, TypeName FROM `bxpert-gcp-ialtube.stg.customer_types`) S ON T.customer_type_id = S.CustomerTypeID WHEN NOT MATCHED THEN INSERT(customer_type_id, customer_type_name) VALUES(S.CustomerTypeID, S.TypeName) WHEN MATCHED AND T.customer_type_name <> S.TypeName THEN UPDATE SET T.customer_type_name = S.TypeName;
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.dim_customer_type` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.customer_types` S WHERE T.customer_type_id = S.CustomerTypeID);
+                          useLegacySql: false
+                  - sync_dim_account_type:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.dim_account_type` T USING (SELECT DISTINCT AccountTypeID, TypeName FROM `bxpert-gcp-ialtube.stg.account_types`) S ON T.account_type_id = S.AccountTypeID WHEN NOT MATCHED THEN INSERT(account_type_id, account_type_name) VALUES(S.AccountTypeID, S.TypeName) WHEN MATCHED AND T.account_type_name <> S.TypeName THEN UPDATE SET T.account_type_name = S.TypeName;
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.dim_account_type` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.account_types` S WHERE T.account_type_id = S.AccountTypeID);
+                          useLegacySql: false
+                  - sync_dim_account_status:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.dim_account_status` T USING (SELECT DISTINCT AccountStatusID, StatusName FROM `bxpert-gcp-ialtube.stg.account_statuses`) S ON T.account_status_id = S.AccountStatusID WHEN NOT MATCHED THEN INSERT(account_status_id, account_status_name) VALUES(S.AccountStatusID, S.StatusName) WHEN MATCHED AND T.account_status_name <> S.StatusName THEN UPDATE SET T.account_status_name = S.StatusName;
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.dim_account_status` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.account_statuses` S WHERE T.account_status_id = S.AccountStatusID);
+                          useLegacySql: false
+                  - sync_dim_loan_status:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.dim_loan_status` T USING (SELECT DISTINCT LoanStatusID, StatusName FROM `bxpert-gcp-ialtube.stg.loan_statuses`) S ON T.loan_status_id = S.LoanStatusID WHEN NOT MATCHED THEN INSERT(loan_status_id, loan_status_name) VALUES(S.LoanStatusID, S.StatusName) WHEN MATCHED AND T.loan_status_name <> S.StatusName THEN UPDATE SET T.loan_status_name = S.StatusName;
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.dim_loan_status` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.loan_statuses` S WHERE T.loan_status_id = S.LoanStatusID);
+                          useLegacySql: false
+                  - sync_dim_transaction_type:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.dim_transaction_type` T USING (SELECT DISTINCT TransactionTypeID, TypeName, CASE WHEN REGEXP_CONTAINS(LOWER(TypeName), r'deposit|abono|ingreso') THEN 'CREDIT' WHEN REGEXP_CONTAINS(LOWER(TypeName), r'withdraw|retiro|cargo|payment|pago') THEN 'DEBIT' ELSE 'NEUTRAL' END AS direction FROM `bxpert-gcp-ialtube.stg.transaction_types`) S ON T.transaction_type_id = S.TransactionTypeID WHEN NOT MATCHED THEN INSERT (transaction_type_id, transaction_type_name, direction) VALUES(S.TransactionTypeID, S.TypeName, S.direction) WHEN MATCHED THEN UPDATE SET T.transaction_type_name = S.TypeName, T.direction = S.direction;
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.dim_transaction_type` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.transaction_types` S WHERE T.transaction_type_id = S.TransactionTypeID);
+                          useLegacySql: false
+                  - sync_dim_geo:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.dim_geo` T
+                            USING (
+                              -- Preparamos la fuente de staging, de-duplicando por AddressID
+                              -- y uniéndola con nuestra tabla de referencia para el enriquecimiento.
+                              WITH StagingDeduplicated AS (
+                                SELECT * FROM (
+                                  SELECT *, ROW_NUMBER() OVER(PARTITION BY AddressID) as rn
+                                  FROM `bxpert-gcp-ialtube.stg.addresses`
+                                ) WHERE rn = 1
+                              )
+                              SELECT
+                                s.AddressID,
+                                s.Street,
+                                s.City,
+                                IFNULL(map.Country, 'Unknown') AS Country
+                              FROM StagingDeduplicated s
+                              LEFT JOIN `bxpert-gcp-ialtube.dwh.ref_city_country_map` map
+                                ON s.City = map.City
+                            ) S
+                            ON T.address_id = S.AddressID
+                            WHEN NOT MATCHED THEN
+                              INSERT (geo_id, address_id, country, city, street)
+                              VALUES(FARM_FINGERPRINT(CAST(S.AddressID AS STRING)), S.AddressID, S.Country, S.City, S.Street)
+                            WHEN MATCHED AND (
+                              IFNULL(T.country, '') <> IFNULL(S.Country, '') OR
+                              IFNULL(T.city, '') <> IFNULL(S.City, '') OR
+                              IFNULL(T.street, '') <> IFNULL(S.Street, '')
+                            ) THEN
+                              UPDATE SET
+                                T.country = S.Country,
+                                T.city = S.City,
+                                T.street = S.Street;
+
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.dim_geo` T
+                            WHERE NOT EXISTS (
+                              SELECT 1 FROM `bxpert-gcp-ialtube.stg.addresses` S
+                              WHERE T.address_id = S.AddressID
+                            );
+                          useLegacySql: false
+
+            - dim_account:
+                steps:
+                  - sync_dim_account:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.dim_account` T USING (SELECT * FROM (SELECT *, ROW_NUMBER() OVER(PARTITION BY AccountID ORDER BY OpeningDate DESC) as rn FROM `bxpert-gcp-ialtube.stg.accounts`) WHERE rn = 1) S ON T.account_id = S.AccountID WHEN NOT MATCHED THEN INSERT (account_id, customer_id, account_type_id, account_status_id, balance, account_open_date) VALUES(S.AccountID, S.CustomerID, S.AccountTypeID, S.AccountStatusID, S.Balance, S.OpeningDate) WHEN MATCHED AND (IFNULL(T.customer_id, 0) <> IFNULL(S.CustomerID, 0) OR IFNULL(T.account_status_id, 0) <> IFNULL(S.AccountStatusID, 0) OR IFNULL(T.balance, 0) <> IFNULL(S.Balance, 0)) THEN UPDATE SET T.customer_id = S.CustomerID, T.account_type_id = S.AccountTypeID, T.account_status_id = S.AccountStatusID, T.balance = S.Balance, T.account_open_date = S.OpeningDate;
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.dim_account` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.accounts` S WHERE T.account_id = S.AccountID);
+                          useLegacySql: false
+
+    - sequential_load_dim_customer:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${project}
+          body:
+            query: "CALL `bxpert-gcp-ialtube.dwh.sp_upsert_dim_customer`()"
+            useLegacySql: false
+
+    - log_dims_done:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '[WF-DWH] FASE 2 completada: Dimensiones sincronizadas.'
+
+       # ========================================================================
+    # FASE 3: Cargar y Sincronizar Hechos 
+    # ========================================================================
+    - parallel_load_facts:
+        parallel:
+          branches:
+            - fact_accounts:
+                steps:
+                  - merge_fact_accounts:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.fact_accounts` T USING (SELECT * FROM (SELECT *, ROW_NUMBER() OVER(PARTITION BY AccountID ORDER BY OpeningDate DESC) as rn FROM `bxpert-gcp-ialtube.stg.accounts`) WHERE rn = 1) S ON T.account_id = S.AccountID WHEN NOT MATCHED THEN INSERT (account_id, customer_id, account_type_id, account_status_id, account_open_date, balance, load_ts) VALUES (S.AccountID, S.CustomerID, S.AccountTypeID, S.AccountStatusID, S.OpeningDate, S.Balance, CURRENT_TIMESTAMP()) WHEN MATCHED AND (IFNULL(T.balance, 0) <> IFNULL(S.Balance, 0) OR IFNULL(T.account_status_id, 0) <> IFNULL(S.AccountStatusID, 0)) THEN UPDATE SET T.balance = S.Balance, T.account_status_id = S.AccountStatusID, T.load_ts = CURRENT_TIMESTAMP();
+                          useLegacySql: false
+                  - delete_orphan_fact_accounts:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.fact_accounts` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.accounts` S WHERE T.account_id = S.AccountID);
+                          useLegacySql: false
+
+            - fact_loans:
+                steps:
+                  - merge_fact_loans:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.fact_loans` T USING (WITH StagingDeduplicated AS (SELECT * FROM (SELECT *, ROW_NUMBER() OVER(PARTITION BY LoanID ORDER BY StartDate DESC, AccountID) as rn FROM `bxpert-gcp-ialtube.stg.loans`) WHERE rn = 1) SELECT s.LoanID, s.AccountID, a.customer_id, s.LoanStatusID, s.PrincipalAmount, s.StartDate, c.geo_id FROM StagingDeduplicated s JOIN `bxpert-gcp-ialtube.dwh.dim_account` a ON s.AccountID = a.account_id JOIN `bxpert-gcp-ialtube.dwh.dim_customer` c ON a.customer_id = c.customer_id AND c.is_current = TRUE) S ON T.loan_id = S.LoanID WHEN NOT MATCHED THEN INSERT (loan_id, account_id, customer_id, loan_status_id, loan_amount, start_date, geo_id, load_ts) VALUES(S.LoanID, S.AccountID, S.customer_id, S.LoanStatusID, S.PrincipalAmount, S.StartDate, S.geo_id, CURRENT_TIMESTAMP()) WHEN MATCHED AND IFNULL(T.loan_status_id, 0) <> IFNULL(S.LoanStatusID, 0) THEN UPDATE SET T.loan_status_id = S.LoanStatusID, T.load_ts = CURRENT_TIMESTAMP();
+                          useLegacySql: false
+                  - delete_orphan_fact_loans:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            DELETE FROM `bxpert-gcp-ialtube.dwh.fact_loans` T WHERE NOT EXISTS (SELECT 1 FROM `bxpert-gcp-ialtube.stg.loans` S WHERE T.loan_id = S.LoanID);
+                          useLegacySql: false
+
+            - fact_transactions:
+                steps:
+                  - merge_fact_transactions:
+                      call: googleapis.bigquery.v2.jobs.query
+                      args:
+                        projectId: ${project}
+                        body:
+                          query: |
+                            MERGE `bxpert-gcp-ialtube.dwh.fact_transactions` T USING (WITH SourcePrepared AS (SELECT *, ROW_NUMBER() OVER(PARTITION BY TransactionID ORDER BY TransactionDate) as rn FROM `bxpert-gcp-ialtube.stg.transactions`) SELECT p.TransactionID, a.customer_id, tt.direction, CASE WHEN tt.direction = 'DEBIT' THEN p.AccountOriginID ELSE p.AccountDestinationID END as account_id, CASE WHEN tt.direction = 'DEBIT' THEN -p.Amount ELSE p.Amount END AS amount_signed, p.Amount, p.TransactionTypeID, p.TransactionDate FROM SourcePrepared p JOIN `bxpert-gcp-ialtube.dwh.dim_transaction_type` tt ON p.TransactionTypeID = tt.transaction_type_id LEFT JOIN `bxpert-gcp-ialtube.dwh.dim_account` a ON a.account_id = (CASE WHEN tt.direction = 'DEBIT' THEN p.AccountOriginID ELSE p.AccountDestinationID END) WHERE p.rn = 1) S ON T.transaction_id = S.TransactionID WHEN NOT MATCHED THEN INSERT (transaction_id, account_id, customer_id, transaction_type_id, amount, amount_signed, transaction_ts, load_ts) VALUES(S.TransactionID, S.account_id, S.customer_id, S.TransactionTypeID, S.Amount, S.amount_signed, S.TransactionDate, CURRENT_TIMESTAMP());
+                          useLegacySql: false
+
+    - log_facts_done:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '[WF-DWH] FASE 3 completada: Hechos sincronizados.'
+
+    # ========================================================================
+    # FASE 4: Snapshot (secuencial)
+    # ========================================================================
+    - call_sp_build_snapshot:
+        call: googleapis.bigquery.v2.jobs.query
+        args:
+          projectId: ${project}
+          body:
+            query: "CALL `bxpert-gcp-ialtube.dwh.sp_build_customer_status_snapshot`(DATE(@run_date))"
+            queryParameters:
+              - name: "run_date"
+                parameterType:
+                  type: "DATE"
+                parameterValue:
+                  value: ${ingestion_date}
+            useLegacySql: false
+
+    - log_snapshot_done:
+        call: sys.log
+        args:
+          severity: "INFO"
+          json:
+            message: '[WF-DWH] FASE 4 completada: Snapshot de actividad calculado.'
+
+    - return_ok:
+        return: "Proceso DWH completado con éxito."
